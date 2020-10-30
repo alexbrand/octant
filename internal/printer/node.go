@@ -8,6 +8,9 @@ package printer
 import (
 	"context"
 	"fmt"
+	"github.com/vmware-tanzu/octant/internal/util/kubernetes"
+	"github.com/vmware-tanzu/octant/pkg/store"
+	"path"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -81,6 +84,9 @@ func NodeHandler(ctx context.Context, node *corev1.Node, options Options) (compo
 	}
 	if err := nh.Images(options); err != nil {
 		return nil, errors.Wrap(err, "print node images")
+	}
+	if err := nh.Pods(ctx, options); err != nil {
+		return nil, errors.Wrap(err, "print node pods")
 	}
 	return o.ToComponent(ctx, options)
 }
@@ -350,6 +356,25 @@ func createNodeImagesView(node *corev1.Node) (*component.Table, error) {
 	return table, nil
 }
 
+var (
+	nodePodsColumns = component.NewTableCols("Namespace", "Name", "Age")
+)
+
+func createNodePodsView(pods []corev1.Pod) (*component.Table, error) {
+	table := component.NewTable("Pods", "There are no Pods running on this node", nodePodsColumns)
+	for _, p := range pods {
+		podRef := path.Join("/overview/namespace", p.Namespace, "workloads", "pods", p.Name)
+		row := component.TableRow{
+			"Namespace": component.NewText(p.Namespace),
+			"Name":      component.NewLink("", p.Name, podRef),
+			"Age":       component.NewTimestamp(p.CreationTimestamp.Time),
+		}
+		table.Add(row)
+	}
+	table.Sort("Namespace", false)
+	return table, nil
+}
+
 type nodeObject interface {
 	Config(options Options) error
 	Addresses(options Options) error
@@ -365,6 +390,7 @@ type nodeHandler struct {
 	resourcesFunc  func(*corev1.Node, Options) (*component.Table, error)
 	conditionsFunc func(*corev1.Node, Options) (*component.Table, error)
 	imagesFunc     func(*corev1.Node, Options) (*component.Table, error)
+	podsFunc       func([]corev1.Pod, Options) (*component.Table, error)
 	object         *Object
 }
 
@@ -386,6 +412,7 @@ func newNodeHandler(node *corev1.Node, object *Object) (*nodeHandler, error) {
 		resourcesFunc:  defaultNodeResources,
 		conditionsFunc: defaultNodeConditions,
 		imagesFunc:     defaultNodeImages,
+		podsFunc:       defaultPodsFunc,
 		object:         object,
 	}
 	return nh, nil
@@ -474,4 +501,46 @@ func (n *nodeHandler) Images(options Options) error {
 
 func defaultNodeImages(node *corev1.Node, options Options) (*component.Table, error) {
 	return createNodeImagesView(node)
+}
+
+func (n *nodeHandler) Pods(ctx context.Context, options Options) error {
+	if n.node == nil {
+		return errors.New("can't display resources for nil node")
+	}
+
+	s := options.DashConfig.ObjectStore()
+	key := store.Key{
+		APIVersion: n.node.APIVersion,
+		Kind:       "Pod",
+		Namespace:  "",
+		Selector:   nil,
+	}
+
+	podList, _, err := s.List(ctx, key)
+	if err != nil {
+		return err
+	}
+
+	nodePods := []corev1.Pod{}
+	for i := range podList.Items {
+		pod := &corev1.Pod{}
+		if err := kubernetes.FromUnstructured(&podList.Items[i], pod); err != nil {
+			return err
+		}
+		if pod.Spec.NodeName == n.node.Name {
+			nodePods = append(nodePods, *pod)
+		}
+	}
+
+	n.object.RegisterItems(ItemDescriptor{
+		Width: component.WidthFull,
+		Func: func() (component.Component, error) {
+			return n.podsFunc(nodePods, options)
+		},
+	})
+	return nil
+}
+
+func defaultPodsFunc(pods []corev1.Pod, _ Options) (*component.Table, error) {
+	return createNodePodsView(pods)
 }
